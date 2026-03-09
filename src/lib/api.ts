@@ -1,125 +1,219 @@
-const API_BASE = '/api';
+import { supabase } from './supabase';
 
-interface ApiOptions {
-  method?: string;
-  body?: unknown;
-  headers?: Record<string, string>;
-}
-
-class ApiError extends Error {
+// ========== Types ==========
+interface ApiError {
+  message: string;
   status: number;
-  constructor(message: string, status: number) {
-    super(message);
-    this.status = status;
-  }
 }
 
-async function request<T>(endpoint: string, options: ApiOptions = {}): Promise<T> {
-  const { method = 'GET', body, headers = {} } = options;
-
-  // 自动注入认证 token
-  const token = localStorage.getItem('access_token');
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const config: RequestInit = {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...headers,
-    },
-  };
-
-  if (body) {
-    config.body = JSON.stringify(body);
-  }
-
-  try {
-    const response = await fetch(`${API_BASE}${endpoint}`, config);
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({ error: '请求失败' }));
-      throw new ApiError(errorData.error || '请求失败', response.status);
-    }
-
-    return await response.json();
-  } catch (err) {
-    if (err instanceof ApiError) throw err;
-    console.error(`[API] Request failed: ${endpoint}`, err);
-    throw new ApiError('网络请求失败，请检查网络连接', 0);
-  }
-}
+const handleError = (error: any): never => {
+  console.error('[Supabase API Error]', error);
+  throw { message: error.message || '操作失败', status: 500 } as ApiError;
+};
 
 // ========== Auth ==========
 export const authApi = {
-  login: (email: string, password: string) =>
-    request<{ message: string; user: unknown; session: { access_token: string; refresh_token: string } }>(
-      '/auth/login',
-      { method: 'POST', body: { email, password } }
-    ),
-  register: (data: { email: string; password: string; role?: string; display_name?: string; phone?: string }) =>
-    request<{ message: string; user: unknown }>('/auth/register', { method: 'POST', body: data }),
-  me: () => request<{ user: unknown; profile: unknown }>('/auth/me'),
+  login: async (email: string, password: string) => {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) return handleError(error);
+    return { 
+      message: '登录成功', 
+      user: data.user, 
+      session: { 
+        access_token: data.session?.access_token || '', 
+        refresh_token: data.session?.refresh_token || '' 
+      } 
+    };
+  },
+  register: async (data: { email: string; password: string; role?: string; display_name?: string; phone?: string }) => {
+    const { data: signUpData, error } = await supabase.auth.signUp({
+      email: data.email,
+      password: data.password,
+    });
+    if (error) return handleError(error);
+
+    // Create profile
+    if (signUpData.user) {
+      const { error: profileError } = await supabase.from('profiles').insert({
+        user_id: signUpData.user.id,
+        role: data.role || 'consumer',
+        display_name: data.display_name || data.email.split('@')[0],
+        phone: data.phone || '',
+      });
+      if (profileError) console.error('Profile creation error:', profileError);
+    }
+
+    return { message: '注册成功', user: signUpData.user };
+  },
+  me: async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return { user: null, profile: null };
+    const { data: profile } = await supabase.from('profiles').select('*').eq('user_id', user.id).single();
+    return { user, profile };
+  },
 };
 
 // ========== Dashboard ==========
 export const dashboardApi = {
-  getStats: () =>
-    request<Array<{ id: number; icon: string; label: string; value: string; change_percent: string }>>('/dashboard/stats'),
+  getStats: async () => {
+    const { data, error } = await supabase.from('dashboard_stats').select('*').order('sort_order', { ascending: true });
+    if (error) return handleError(error);
+    return data;
+  },
 };
 
 // ========== Products ==========
 export const productsApi = {
-  list: () => request<Array<Record<string, unknown>>>('/products'),
-  detail: (id: string | number) =>
-    request<{
-      id: number; name: string; grade: string; origin: string; description: string;
-      image_url: string; sugar_degree: string; diameter_mm: number; weight_g: number;
-      trace_steps: Array<{ title: string; step_time: string; description: string; is_active: boolean; sort_order: number }>;
-    }>(`/products/${id}`),
+  list: async () => {
+    const { data, error } = await supabase.from('products').select('*').order('created_at', { ascending: false });
+    if (error) return handleError(error);
+    return data;
+  },
+  detail: async (id: string | number) => {
+    const { data: product, error: productError } = await supabase.from('products').select('*').eq('id', id).single();
+    if (productError) return handleError(productError);
+
+    const { data: traceSteps } = await supabase.from('product_trace_steps').select('*').eq('product_id', id).order('sort_order', { ascending: true });
+    return { ...product, trace_steps: traceSteps || [] };
+  },
 };
 
 // ========== Traceability ==========
 export const traceabilityApi = {
-  getStats: () =>
-    request<{ total_batches: string; node_status: string; query_count_today: string; anomaly_count: number }>('/traceability/stats'),
-  getBatches: () => request<Array<Record<string, unknown>>>('/traceability/batches'),
-  getBatch: (id: string | number) => request<Record<string, unknown>>(`/traceability/batches/${id}`),
-  getNodes: () =>
-    request<Array<{ id: number; name: string; latency: string; load: string; status: string }>>('/traceability/nodes'),
+  getStats: async () => {
+    const { data: batches, error } = await supabase.from('traceability_batches').select('*');
+    if (error) return handleError(error);
+
+    const totalBatches = batches?.length || 0;
+    const totalNodes = batches?.reduce((sum, b) => sum + (b.total_nodes || 0), 0) || 0;
+    const activeNodes = batches?.reduce((sum, b) => sum + (b.active_nodes || 0), 0) || 0;
+    const queryCountToday = batches?.reduce((sum, b) => sum + (b.query_count_today || 0), 0) || 0;
+    const anomalyCount = batches?.reduce((sum, b) => sum + (b.anomaly_count || 0), 0) || 0;
+
+    return {
+      total_batches: totalBatches.toLocaleString(),
+      node_status: `${activeNodes} / ${totalNodes}`,
+      query_count_today: queryCountToday >= 1000 ? (queryCountToday / 1000).toFixed(1) + 'k' : queryCountToday.toString(),
+      anomaly_count: anomalyCount,
+    };
+  },
+  getBatches: async () => {
+    const { data, error } = await supabase.from('traceability_batches').select('*').order('created_at', { ascending: false });
+    if (error) return handleError(error);
+    return data;
+  },
+  getBatch: async (id: string | number) => {
+    const { data: batch, error: batchError } = await supabase.from('traceability_batches').select('*').eq('id', id).single();
+    if (batchError) return handleError(batchError);
+
+    const { data: steps } = await supabase.from('traceability_steps').select('*').eq('batch_id', id).order('sort_order', { ascending: true });
+    return { ...batch, steps: steps || [] };
+  },
+  getNodes: async () => {
+    const { data, error } = await supabase.from('traceability_nodes').select('*').order('id', { ascending: true });
+    if (error) return handleError(error);
+    return data;
+  },
+  createBatch: async (data: { batch_code: string; farmer_name: string; sugar_degree?: string; product_id?: number }) => {
+    const { data: batch, error: batchErr } = await supabase.from('traceability_batches').insert({
+      batch_code: data.batch_code,
+      product_id: data.product_id || 1,
+      status: 'active',
+      total_nodes: 16,
+      active_nodes: 1,
+      query_count_today: 0,
+      anomaly_count: 0,
+    }).select().single();
+
+    if (batchErr) return handleError(batchErr);
+
+    await supabase.from('traceability_steps').insert({
+      batch_id: batch.id,
+      step_name: '生态种植',
+      step_date: new Date().toISOString().split('T')[0].replace(/-/g, '.'),
+      icon: 'potted_plant',
+      is_active: true,
+      is_current: true,
+      sort_order: 1,
+    });
+
+    return { message: '上链成功', batch_id: batch.id };
+  }
 };
 
 // ========== GIS ==========
 export const gisApi = {
-  getOverview: () =>
-    request<{ total_production: number; verification_rate: number; system_health: number }>('/gis/overview'),
-  getZones: () =>
-    request<Array<{ id: number; name: string; color: string; area_value: string }>>('/gis/zones'),
-  getAlerts: () =>
-    request<Array<{ id: number; title: string; description: string; severity: string; zone_code: string }>>('/gis/alerts'),
+  getOverview: async () => {
+    const { data, error } = await supabase.from('gis_overview').select('*').single();
+    if (error) return handleError(error);
+    return data;
+  },
+  getZones: async () => {
+    const { data, error } = await supabase.from('gis_zones').select('*').order('id', { ascending: true });
+    if (error) return handleError(error);
+    return data;
+  },
+  getAlerts: async () => {
+    const { data, error } = await supabase.from('alerts').select('*').order('created_at', { ascending: false });
+    if (error) return handleError(error);
+    return data;
+  },
 };
 
 // ========== Capacity ==========
 export const capacityApi = {
-  getLines: () =>
-    request<Array<{ id: number; name: string; status: string; efficiency: string; daily_output: string; color: string; progress: number }>>('/capacity/lines'),
-  getLogs: () =>
-    request<Array<{ id: number; log_time: string; message: string; log_type: string }>>('/capacity/logs'),
-  circuitBreak: () =>
-    request<{ message: string }>('/capacity/circuit-break', { method: 'POST' }),
+  getLines: async () => {
+    const { data, error } = await supabase.from('production_lines').select('*').order('id', { ascending: true });
+    if (error) return handleError(error);
+    return data;
+  },
+  getLogs: async () => {
+    const { data, error } = await supabase.from('production_logs').select('*').order('created_at', { ascending: false }).limit(20);
+    if (error) return handleError(error);
+    return data;
+  },
+  circuitBreak: async () => {
+    const { error } = await supabase.from('production_lines').update({ status: 'Halted', progress: 0, efficiency: '0%' }).neq('status', 'Maintenance');
+    if (error) return handleError(error);
+
+    await supabase.from('production_logs').insert({
+      log_time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+      message: '全链熔断保护已触发，所有活跃产线已锁定',
+      log_type: 'error',
+    });
+
+    return { message: '已触发全链熔断保护机制！' };
+  },
 };
 
 // ========== Harvest ==========
 export const harvestApi = {
-  getLogs: () =>
-    request<Array<{ id: number; log_time: string; user_name: string; action: string; amount: string; location: string }>>('/harvest/logs'),
+  getLogs: async () => {
+    const { data, error } = await supabase.from('harvest_logs').select('*').order('created_at', { ascending: false }).limit(20);
+    if (error) return handleError(error);
+    return data;
+  },
 };
 
 // ========== Admin ==========
 export const adminApi = {
-  getUsers: () =>
-    request<Array<{ id: string; user_id: string; role: string; display_name: string; phone: string; created_at: string }>>('/admin/users'),
-  getTraces: () =>
-    request<Array<{ id: number; batch_code: string; product_name: string; status: string; total_nodes: number; active_nodes: number; created_at: string }>>('/admin/traces'),
+  getUsers: async () => {
+    const { data, error } = await supabase.from('profiles').select('id, user_id, role, display_name, phone, created_at').order('created_at', { ascending: false });
+    if (error) return handleError(error);
+    return data;
+  },
+  getTraces: async () => {
+    const { data: batches, error } = await supabase.from('traceability_batches').select(`id, batch_code, status, total_nodes, active_nodes, created_at, products ( name )`).order('created_at', { ascending: false });
+    if (error) return handleError(error);
+    return batches.map((b: any) => ({
+      id: b.id,
+      batch_code: b.batch_code,
+      product_name: b.products?.name || '未知产品',
+      status: b.status,
+      total_nodes: b.total_nodes,
+      active_nodes: b.active_nodes,
+      created_at: b.created_at,
+    }));
+  },
 };
+
